@@ -17,6 +17,7 @@ conda activate gnn-bench
 **2. Install PyTorch via pip (avoids MKL conflict with conda)**
 ```bash
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+pip install cugraph-cu12
 ```
 
 **3. Install PyG and sparse kernels**
@@ -49,4 +50,11 @@ python benchmark.py --dataset cora
 python benchmark.py --dataset arxiv
 python benchmark.py --dataset citeseer
 python benchmark.py --dataset pubmed
+```
+
+for CuGraph
+we have to use a different env to run this 
+```bash
+conda create -n cugraph-bench python=3.11 -y
+conda activate cugraph-bench
 ```
