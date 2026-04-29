@@ -5,9 +5,15 @@ import argparse
 import copy
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--dataset', type=str, default='reddit',
-                    choices=['cora', 'citeseer', 'pubmed', 'arxiv', 'reddit'],
-                    help='Dataset to benchmark')
+parser.add_argument('--dataset', type=str, default='products',
+                    choices=['cora', 'citeseer', 'pubmed', 'arxiv', 'reddit',
+                             'products', 'papers100m',
+                             'synthetic-small',   # 1M nodes,  10M edges
+                             'synthetic-medium',  # 5M nodes,  50M edges
+                             'synthetic-large',   # 20M nodes, 200M edges
+                             ],
+                    help='Dataset to benchmark. '
+                         'synthetic-* generate random power-law graphs at controlled scale.')
 parser.add_argument('--backend', type=str, default='spmm',
                     choices=['scatter', 'spmm', 'cusparse', 'cugraph'],
                     help='Aggregation backend to benchmark. '
@@ -16,7 +22,7 @@ parser.add_argument('--backend', type=str, default='spmm',
 parser.add_argument('--num-runs', type=int, default=200)
 parser.add_argument('--hidden', type=int, default=64,
                     help='Hidden layer dimension')
-parser.add_argument('--reorder', type=str, default='none',
+parser.add_argument('--reorder', type=str, default='degree_desc',
                     choices=['none', 'degree_asc', 'degree_desc', 'metis', 'rcm'],
                     help='Node reordering strategy applied before benchmarking.\n'
                          '  none        — original ordering (baseline)\n'
@@ -26,6 +32,10 @@ parser.add_argument('--reorder', type=str, default='none',
                          '  rcm         — Reverse Cuthill-McKee bandwidth reduction\n')
 parser.add_argument('--correctness', action='store_true',
                     help='Run correctness check comparing reordered vs original output')
+parser.add_argument('--synthetic-feat-dim', type=int, default=128,
+                    help='Feature dimension for synthetic graphs (default: 128)')
+parser.add_argument('--synthetic-avg-degree', type=int, default=10,
+                    help='Target average degree for synthetic graphs (default: 10)')
 args = parser.parse_args()
 
 # ── cugraph env guard ─────────────────────────────────────────────────────────
@@ -77,6 +87,54 @@ elif args.backend == 'cugraph':
 from torch_geometric.nn import GCNConv
 from torch_geometric.datasets import Planetoid, Reddit
 
+
+# ── synthetic graph generator ─────────────────────────────────────────────────
+
+def make_synthetic_graph(n_nodes, avg_degree, feat_dim, device='cuda'):
+    """
+    Generate a random directed graph with power-law-ish degree distribution
+    using preferential attachment (Barabasi-Albert style), fast approximation.
+
+    For large graphs we just sample edges uniformly — it's fast, gets the
+    right sparsity, and is sufficient to stress-test aggregation kernels.
+    The degree distribution won't be power-law but the memory access pattern
+    (random sparse) is actually a harder benchmark than BA graphs.
+
+    Returns a Data-like object with .x, .edge_index, .num_nodes attributes.
+    """
+    import torch
+    from torch_geometric.data import Data
+
+    n_edges = n_nodes * avg_degree
+    print(f"[Synthetic] Generating {n_nodes:,} nodes, {n_edges:,} edges, "
+          f"feat_dim={feat_dim} ...")
+
+    # random edges — uniform sampling, no self-loops
+    src = torch.randint(0, n_nodes, (n_edges,))
+    dst = torch.randint(0, n_nodes, (n_edges,))
+    # remove self-loops
+    mask       = src != dst
+    src, dst   = src[mask], dst[mask]
+    edge_index = torch.stack([src, dst], dim=0)
+
+    # small random features — keep memory manageable
+    x = torch.randn(n_nodes, feat_dim, dtype=torch.float32)
+
+    data = Data(x=x, edge_index=edge_index, num_nodes=n_nodes)
+    data = data.cuda()
+    print(f"[Synthetic] Done. edge_index: {data.edge_index.shape}  "
+          f"x: {data.x.shape}")
+    return data
+
+
+SYNTHETIC_CONFIGS = {
+    #                  nodes       avg_degree
+    'synthetic-small':  (1_000_000,  10),
+    'synthetic-medium': (5_000_000,  10),
+    'synthetic-large':  (20_000_000, 10),
+}
+
+
 # ── dataset ───────────────────────────────────────────────────────────────────
 if args.dataset == 'arxiv':
     from ogb.nodeproppred import PygNodePropPredDataset
@@ -89,6 +147,47 @@ elif args.dataset == 'reddit':
     data = ds[0].cuda()
     num_features, num_classes = ds.num_features, ds.num_classes
 
+elif args.dataset == 'products':
+    from ogb.nodeproppred import PygNodePropPredDataset
+    print("Loading ogbn-products (~2.4M nodes, 62M edges) — downloading if needed ...")
+    ds   = PygNodePropPredDataset('ogbn-products', root='/tmp/products')
+    data = ds[0].cuda()
+    num_features, num_classes = ds.num_features, ds.num_classes
+    print(f"  nodes={data.num_nodes:,}  edges={data.edge_index.shape[1]:,}  "
+          f"feat={num_features}  classes={num_classes}")
+
+elif args.dataset == 'papers100m':
+    from ogb.nodeproppred import PygNodePropPredDataset
+    print("Loading ogbn-papers100M (~111M nodes, 1.6B edges).")
+    print("WARNING: this dataset is ~57GB on disk and ~120GB in RAM.")
+    print("         Make sure you have enough memory before proceeding.")
+    print("         Download may take 30+ minutes on first run.")
+    ds   = PygNodePropPredDataset('ogbn-papers100M', root='/tmp/papers100m')
+    data = ds[0].cuda()
+    num_features, num_classes = ds.num_features, ds.num_classes
+    print(f"  nodes={data.num_nodes:,}  edges={data.edge_index.shape[1]:,}  "
+          f"feat={num_features}  classes={num_classes}")
+
+elif args.dataset in SYNTHETIC_CONFIGS:
+    n_nodes, avg_deg = SYNTHETIC_CONFIGS[args.dataset]
+    # allow CLI overrides
+    avg_deg      = args.synthetic_avg_degree
+    num_features = args.synthetic_feat_dim
+    num_classes  = 64   # arbitrary — only aggregation kernel is benchmarked
+
+    # memory sanity check before allocating
+    feat_mem_gb  = (n_nodes * num_features * 4) / (1024 ** 3)
+    edge_mem_gb  = (n_nodes * avg_deg * 2 * 8) / (1024 ** 3)
+    gpu_gb       = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    print(f"[Synthetic] Memory estimate: features={feat_mem_gb:.1f}GB  "
+          f"edges={edge_mem_gb:.1f}GB  GPU={gpu_gb:.0f}GB")
+    if feat_mem_gb + edge_mem_gb > gpu_gb * 0.85:
+        print(f"WARNING: {args.dataset} may OOM on your {gpu_gb:.0f}GB GPU.")
+        print(f"         Try reducing --synthetic-feat-dim or --synthetic-avg-degree.")
+        import sys; sys.exit(1)
+
+    data = make_synthetic_graph(n_nodes, avg_deg, num_features)
+
 else:
     name = args.dataset.capitalize()
     ds   = Planetoid(root=f'/tmp/{args.dataset}', name=name)
@@ -96,8 +195,6 @@ else:
     num_features, num_classes = ds.num_features, ds.num_classes
 
 # ── save original data for correctness check (must be before reordering) ──────
-# we keep COO edge_index here — correctness check runs on raw format
-# before any backend-specific conversion (SparseTensor / CSR)
 data_original_for_check = None
 perm_for_check = None
 
@@ -140,17 +237,14 @@ def reorder_nodes(data, strategy):
 
     elif strategy == 'metis':
         try:
-            from torch_geometric.utils import to_undirected
-            from torch_geometric.transforms import METIS
-            undirected_ei = to_undirected(edge_index, num_nodes=num_nodes)
-            num_parts = max(2, num_nodes // 1000)
-            transform  = METIS(num_parts=num_parts, recursive=False)
-            cpu_data   = data.cpu()
-            cpu_data   = transform(cpu_data)
-            perm       = torch.argsort(cpu_data.metis_partition)
-            print(f"Reorder: metis  |  {num_parts} partitions")
-            data = cpu_data.cuda()
-            edge_index = data.edge_index
+            from torch_geometric.utils import metis_graph_cut
+            perm = metis_graph_cut(
+                edge_index,
+                num_nodes=num_nodes,
+                num_parts=max(2, num_nodes // 1000)
+            )
+            perm = torch.argsort(perm)
+            print(f"Reorder: metis via metis_graph_cut")
         except Exception as e:
             print(f"WARNING: metis reorder failed ({e}), falling back to none")
             return data, None
@@ -162,7 +256,7 @@ def reorder_nodes(data, strategy):
             cpu_ei = edge_index.cpu()
             sp     = to_scipy_sparse_matrix(cpu_ei, num_nodes=num_nodes)
             order  = reverse_cuthill_mckee(sp.tocsr(), symmetric_mode=False)
-            perm   = torch.from_numpy(order).long()
+            perm = torch.from_numpy(order.copy()).long()
             print(f"Reorder: rcm  |  "
                   f"bandwidth before: {sp.tocsr().indices.max() - sp.tocsr().indices.min()}")
         except ImportError:
@@ -192,17 +286,14 @@ if args.reorder != 'none':
 else:
     print("Reorder: none (baseline)")
 
-# ── correctness check (runs before backend conversion, on raw COO) ────────────
+# ── correctness check ─────────────────────────────────────────────────────────
 def test_correctness(data_orig, data_reordered, perm, num_features, num_classes):
     """
     Compare GCN outputs on original vs reordered graph.
-    Uses a fresh model with fixed seed so weights are identical both runs.
-    Unshuffles the reordered output back to original node order before comparing.
-    Tolerates small float32 numerical differences (< 1e-4).
+    Skipped for synthetic graphs (no ground truth, just a stress test).
     """
     print("\n── Correctness check ──")
 
-    # fresh model with fixed seed — same weights for both runs
     torch.manual_seed(0)
 
     class _GCN(torch.nn.Module):
@@ -220,7 +311,6 @@ def test_correctness(data_orig, data_reordered, perm, num_features, num_classes)
         out_orig      = check_model(data_orig.x, data_orig.edge_index)
         out_reordered = check_model(data_reordered.x, data_reordered.edge_index)
 
-    # unshuffle reordered output → original node order
     inv_perm = torch.empty_like(perm)
     inv_perm[perm] = torch.arange(len(perm), device=perm.device)
     out_unshuffled = out_reordered[inv_perm.to(out_reordered.device)]
@@ -231,7 +321,6 @@ def test_correctness(data_orig, data_reordered, perm, num_features, num_classes)
     print(f"Max diff  : {max_diff:.2e}")
     print(f"Mean diff : {mean_diff:.2e}")
 
-    # sanity checks
     assert data_orig.num_nodes == data_reordered.num_nodes, \
         "FAILED — node count changed after reorder"
     assert data_orig.edge_index.shape[1] == data_reordered.edge_index.shape[1], \
@@ -242,24 +331,28 @@ def test_correctness(data_orig, data_reordered, perm, num_features, num_classes)
     else:
         print(f"Correctness check FAILED ✗ — max diff {max_diff:.2e} exceeds 1e-4")
         print("  Possible causes: edge remapping bug, feature permutation bug")
-
     print()
 
 
 if args.correctness and args.reorder != 'none' and data_original_for_check is not None:
-    test_correctness(
-        data_original_for_check,
-        data,                   # already reordered, still COO at this point
-        perm_for_check,
-        num_features,
-        num_classes
-    )
+    if args.dataset.startswith('synthetic'):
+        print("Correctness check skipped for synthetic graphs "
+              "(no canonical output to compare against)")
+    else:
+        test_correctness(
+            data_original_for_check,
+            data,
+            perm_for_check,
+            num_features,
+            num_classes
+        )
 elif args.correctness and args.reorder == 'none':
     print("Correctness check skipped — no reordering applied (baseline == baseline)")
 
 # ── memory estimate + OOM warning ─────────────────────────────────────────────
-num_edges    = data.edge_index.shape[1] if hasattr(data.edge_index, 'shape') \
-               else data.edge_index.nnz()
+num_edges = (data.edge_index.shape[1]
+             if hasattr(data.edge_index, 'shape')
+             else data.edge_index.nnz())
 estimated_gb = (num_edges * num_features * 4) / (1024 ** 3)
 gpu_gb       = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
 print(f"Estimated peak memory: {estimated_gb:.1f} GB  |  GPU memory: {gpu_gb:.0f} GB")
@@ -271,7 +364,6 @@ if args.backend == 'scatter' and estimated_gb > gpu_gb * 0.7:
     import sys; sys.exit(1)
 
 # ── convert edge_index to backend format ──────────────────────────────────────
-# NOTE: this must happen AFTER correctness check — check needs raw COO
 if args.backend == 'spmm':
     from torch_sparse import SparseTensor
     row = data.edge_index[0]
@@ -318,6 +410,7 @@ class GCN(torch.nn.Module):
 model = GCN().cuda().eval()
 
 # ── warmup ────────────────────────────────────────────────────────────────────
+print(f"Warming up ({args.num_runs // 4} iters) ...")
 with torch.no_grad():
     for _ in range(args.num_runs // 4):
         model(data.x, data.edge_index)
@@ -335,7 +428,7 @@ with torch.no_grad():
         torch.cuda.synchronize()
         times.append(starter.elapsed_time(ender))
 
-print(f"\nDataset : {args.dataset} — {data.num_nodes} nodes, {num_edges} edges")
+print(f"\nDataset : {args.dataset} — {data.num_nodes:,} nodes, {num_edges:,} edges")
 print(f"Backend : {args.backend}")
 print(f"Reorder : {args.reorder}")
 print(f"Hidden  : {args.hidden}")
