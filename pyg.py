@@ -8,7 +8,7 @@ Module layout (same directory):
   reorder.py    — Node permutations (none, degree_*, rcm, …)
   models.py     — GCN, CuSparseGCN, CustomSpMMGCN
   data.py       — load_dataset, prepare_backend_data
-  benchmark.py  — timing, correctness, model factory
+  benchmark2.py — timing, correctness, model factory
 """
 
 import inspect
@@ -29,7 +29,7 @@ if "weights_only" in inspect.signature(torch.load).parameters:
 
     torch.load = _torch_load_compat
 
-from benchmark import (
+from benchmark2 import (
     CUSTOM_ALL_BACKENDS,
     benchmark_forward,
     model_for_backend,
