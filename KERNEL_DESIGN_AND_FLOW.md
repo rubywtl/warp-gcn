@@ -12,13 +12,14 @@ This document describes **`pyg.py`**: Graph Convolutional Network (GCN) forward 
 
 For a fixed **2-layer GCN-style** network, each layer applies **sparse–dense matrix multiplication (SpMM)**:
 
-\[
-\mathbf{X}' \approx \tilde{\mathbf{A}} \, \mathbf{X}
-\]
+```
+X' = A_tilde @ X
+```
 
-where \(\tilde{\mathbf{A}}\) is a **row-normalized adjacency with self-loops** (exactly **`gcn_norm`** in PyG → CSR in this codebase for GPU backends). \(\mathbf{X}\) is **`[num_nodes, feat_dim]`**.
+- **A_tilde** — row-normalized adjacency **with self-loops** (from PyG **`gcn_norm`**; on GPU backends this becomes **CSR**: `row_ptr`, `col_idx`, `values`).
+- **X** — node features, shape **`[num_nodes, feat_dim]`**.
 
-Non-custom backends use **`GCNConv`** (PyG) or **`torch.sparse.mm`**. Custom backends replace only the SpMM multiply with handwritten CUDA kernels on **CSR** \((\) `row_ptr`, `col_idx`, `values` \()\).
+Non-custom backends use **`GCNConv`** (PyG) or **`torch.sparse.mm`**. Custom backends replace only the SpMM multiply with handwritten CUDA kernels on that **CSR** triple.
 
 ### 1.2 End-to-end model shapes (conceptual)
 
@@ -45,7 +46,7 @@ Two different “GCN wrappers” exist:
 |--------|--------------------------|
 | `perm[i]` | **New** node ID for **original** vertex `i` (**gather** permutation on rows of `x`). Implemented as **`data.x = data.x[perm]`**. |
 | `inv[old_id]` | **New** ID of vertex that was **`old_id`** before reorder; used to remap **`edge_index`**: `inv[row], inv[col]`. Built as `inv[perm] = arange(N)`. |
-| `row_ptr`, `col_idx`, `values` | Standard **CSR** of **normalized** adjacency \(\tilde{\mathbf{A}}\) (**after** reorder). |
+| `row_ptr`, `col_idx`, `values` | Standard **CSR** of **normalized** adjacency **A_tilde** (**after** reorder). |
 | `degree` (reorder) | Undirected-ish count `bincount(row ∪ col)` for ordering strategies (`degree_desc`, …). Not the same as CSR row lengths used for **`custom_degree`** buckets (those come from **`row_ptr[1:]-row_ptr[:-1]`** after normalization). |
 | **`custom_cache`** | Dict of tensors passed into `CustomSpMMGCN`: CSR parts + **`small_rows`** / **`medium_rows`** / **`large_rows`** + **`task_*`** for split_atomic. Built in **`prepare_backend_data`** ≈ `664`. |
 
