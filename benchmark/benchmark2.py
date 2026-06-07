@@ -1,5 +1,6 @@
 """
-Timing, correctness checks, and model factory.
+The benchmark focuses on timing, correctness checks, and model factory
+of our custom SpMM backends, as well as the built-in edge_index and spmm backends.
 """
 
 import time
@@ -7,7 +8,7 @@ import time
 import torch
 
 from models import CuSparseGCN, CustomSpMMGCN, GCN
-from spmm_cuda import load_spmm_extension
+from kernels.spmm_cuda import load_spmm_extension
 
 CUSTOM_ALL_BACKENDS = (
     "custom_simple",

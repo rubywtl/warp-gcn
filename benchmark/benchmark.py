@@ -1,3 +1,8 @@
+'''
+This benchmark is designed to evaluate the performance of different graphs neighbord
+aggregation backends on various datasets and graph reorderings. It supports both real-world datasets
+'''
+
 import torch
 import torch.nn.functional as F
 import numpy as np
