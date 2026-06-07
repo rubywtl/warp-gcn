@@ -8,6 +8,8 @@ Evaluated on Reddit and ogbn-products, Adapti achieves up to **1.21x speedup** o
 
 GCN inference is bottlenecked by SpMM in the neighbor aggregation step. Under a naive row-parallel assignment, warps assigned to high-degree nodes do orders of magnitude more work than those assigned to low-degree nodes, stalling the kernel. Adapti reorders the input graph once before inference, grouping nodes into degree-sorted buckets that are evenly distributed across GPU thread blocks. This eliminates warp divergence and improves effective GPU utilization without modifying the SpMM kernel's math or the model weights.
 
+![Solution overview](assets/img/solution.png)
+
 
 ## Environment setup
 
